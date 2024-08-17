@@ -9,12 +9,15 @@ package com.skcraft.launcher.launch;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.io.Files;
 import com.skcraft.concurrency.DefaultProgress;
 import com.skcraft.concurrency.ProgressObservable;
 import com.skcraft.launcher.*;
 import com.skcraft.launcher.auth.Session;
 import com.skcraft.launcher.install.ZipExtract;
+import com.skcraft.launcher.launch.runtime.JavaRuntime;
+import com.skcraft.launcher.launch.runtime.JavaRuntimeFinder;
 import com.skcraft.launcher.model.minecraft.*;
 import com.skcraft.launcher.persistence.Persistence;
 import com.skcraft.launcher.util.Environment;
@@ -34,6 +37,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CancellationException;
+import java.util.function.BiPredicate;
 
 import static com.skcraft.launcher.LauncherUtils.checkInterrupted;
 import static com.skcraft.launcher.util.SharedLocale.tr;
@@ -51,6 +56,7 @@ public class Runner implements Callable<Process>, ProgressObservable {
     private final Instance instance;
     private final Session session;
     private final File extractDir;
+    private final BiPredicate<JavaRuntime, JavaVersion> javaRuntimeMismatch;
     @Getter @Setter private Environment environment = Environment.getInstance();
 
     private VersionManifest versionManifest;
@@ -63,18 +69,20 @@ public class Runner implements Callable<Process>, ProgressObservable {
 
     /**
      * Create a new instance launcher.
-     *
-     * @param launcher the launcher
+     *  @param launcher the launcher
      * @param instance the instance
      * @param session the session
      * @param extractDir the directory to extract to
+     * @param javaRuntimeMismatch
      */
     public Runner(@NonNull Launcher launcher, @NonNull Instance instance,
-                  @NonNull Session session, @NonNull File extractDir) {
+                  @NonNull Session session, @NonNull File extractDir,
+                  BiPredicate<JavaRuntime, JavaVersion> javaRuntimeMismatch) {
         this.launcher = launcher;
         this.instance = instance;
         this.session = session;
         this.extractDir = extractDir;
+        this.javaRuntimeMismatch = javaRuntimeMismatch;
         this.featureList = new FeatureList.Mutable();
     }
 
@@ -132,7 +140,6 @@ public class Runner implements Callable<Process>, ProgressObservable {
         }
 
         progress = new DefaultProgress(0.9, SharedLocale.tr("runner.collectingArgs"));
-        builder.classPath(getJarPath());
         builder.setMainClass(versionManifest.getMainClass());
 
         addWindowArgs();
@@ -145,6 +152,8 @@ public class Runner implements Callable<Process>, ProgressObservable {
         addLegacyArgs();
 
         callLaunchModifier();
+
+        verifyJavaRuntime();
 
         ProcessBuilder processBuilder = new ProcessBuilder(builder.buildCommand());
         processBuilder.directory(instance.getContentDir());
@@ -161,6 +170,23 @@ public class Runner implements Callable<Process>, ProgressObservable {
      */
     private void callLaunchModifier() {
         instance.modify(builder);
+    }
+
+    private void verifyJavaRuntime() {
+        JavaRuntime pickedRuntime = builder.getRuntime();
+        JavaVersion targetVersion = versionManifest.getJavaVersion();
+
+        if (pickedRuntime == null || targetVersion == null) {
+            return;
+        }
+
+        if (pickedRuntime.getMajorVersion() != targetVersion.getMajorVersion()) {
+            boolean launchAnyway = javaRuntimeMismatch.test(pickedRuntime, targetVersion);
+
+            if (!launchAnyway) {
+                throw new CancellationException("Launch cancelled by user.");
+            }
+        }
     }
 
     /**
@@ -205,6 +231,9 @@ public class Runner implements Callable<Process>, ProgressObservable {
                         tr("runner.missingLibrary", instance.getTitle(), library.getName()));
             }
         }
+
+        // The official launcher puts the vanilla jar at the end of the classpath, we'll do the same
+        builder.classPath(getJarPath());
     }
 
     /**
@@ -255,13 +284,8 @@ public class Runner implements Callable<Process>, ProgressObservable {
                         .orElse(config.getJavaRuntime())
                 );
 
-        // Builder defaults to a found runtime or just the PATH `java` otherwise
-        if (selectedRuntime != null) {
-            String rawJvmPath = selectedRuntime.getDir().getAbsolutePath();
-            if (!Strings.isNullOrEmpty(rawJvmPath)) {
-                builder.tryJvmPath(new File(rawJvmPath));
-            }
-        }
+        // Builder defaults to the PATH `java` if the runtime is null
+        builder.setRuntime(selectedRuntime);
 
         List<String> flags = builder.getFlags();
         String[] rawJvmArgsList = new String[] {
@@ -283,6 +307,16 @@ public class Runner implements Callable<Process>, ProgressObservable {
                     flags.add(substitutor.replace(subArg));
                 }
             }
+        }
+
+        if (versionManifest.getLogging() != null && versionManifest.getLogging().getClient() != null) {
+            log.info("Logging config present, log4j2 bug likely mitigated");
+
+            VersionManifest.LoggingConfig config = versionManifest.getLogging().getClient();
+            File configFile = new File(launcher.getLibrariesDir(), config.getFile().getId());
+            StrSubstitutor loggingSub = new StrSubstitutor(ImmutableMap.of("path", configFile.getAbsolutePath()));
+
+            flags.add(loggingSub.replace(config.getArgument()));
         }
     }
 
